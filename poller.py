@@ -14,14 +14,15 @@ import sys
 from subprocess import Popen, PIPE
 from pysnmp.entity.rfc3413.oneliner import cmdgen
 import obvescanje
-import xmltodict
+from lxml import etree
 import redis
+from influxdb import InfluxDBClient
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 
-__version__ = '2.0'
+__version__ = '2.1'
 __author__ = 'Peter Ciber'
-__date__ = '30.12.2016'
+__date__ = '06.07.2017'
 
 def DumpJSON(data):
     with open(SCRIPT_DIR + '/' + 'poller.json', 'w') as f:
@@ -67,20 +68,22 @@ def SNMPPoller():
             for oid, value in SnmpData:
                 if oid.prettyPrint() in snmp['vars']:
                     if value.prettyPrint() == 'No Such Instance currently exists at this OID':
-                        #print snmp['dev'], oid.prettyPrint(), value.prettyPrint()
                         debug = '  ' + snmp['vars'][oid.prettyPrint()] + ' ' + oid.prettyPrint() + ' ' +  value.prettyPrint()
                         AddEntryToSyslog(debug)
                         Debug(debug)
                         mytmpdict[snmp['vars'][oid.prettyPrint()]] = 0
                     else:
-                        mytmpdict[snmp['vars'][oid.prettyPrint()]] = value.prettyPrint()
-                        debug = '  ' + snmp['vars'][oid.prettyPrint()] + ', ' + oid.prettyPrint() + ', ' + value.prettyPrint()
+                        if snmp['vars'][oid.prettyPrint()] in snmp['multiplier']:
+                            mytmpdict[snmp['vars'][oid.prettyPrint()]] = float(value.prettyPrint()) * snmp['multiplier'][snmp['vars'][oid.prettyPrint()]]
+                        else:
+                            mytmpdict[snmp['vars'][oid.prettyPrint()]] = value.prettyPrint()
+                        debug = '  ' + snmp['vars'][oid.prettyPrint()] + ', ' + oid.prettyPrint() + ', ' + str(mytmpdict[snmp['vars'][oid.prettyPrint()]])
                         Debug(debug)
         except:
-            debug = ' Error polling SNMP device: %s %s' % (traceback.format_exc(), SnmpData)
-            AddEntryToSyslog(debug)
-            Debug(debug)
-            pass
+           debug = ' Error polling SNMP device: %s %s' % (traceback.format_exc(), SnmpData)
+           AddEntryToSyslog(debug)
+           Debug(debug)
+           pass
         mydict[snmp['dev']] = mytmpdict
     return mydict
 
@@ -124,11 +127,9 @@ def JSONPoller():
 
 
 def XMLGetValues(url):
-    XMLdata = {}
     try:
         response = urllib2.urlopen(url, timeout = poller_settings.XML_POLLER_TIMEOUT);
-        htmlpage = response.read()
-        XMLdata = xmltodict.parse(htmlpage)
+        xml = response.read()
         debug = ' Getting XML data from: %s' % (url)
         Debug(debug)
     except:
@@ -136,28 +137,27 @@ def XMLGetValues(url):
         debug = ' Error getting XML data from: %s' % url
         AddEntryToSyslog(debug)
         Debug(debug)
-    return XMLdata
+    return xml
 
 def XMLPoller():
     mydict = {}
+    mytmpdict = {}
     for xml in poller_settings.XML_POLLER:
-        xml_data = XMLGetValues(xml['url'])
-        mytmpdict = {}
-        for var_name, var_path in xml['vars'].iteritems():
-            multiplier = var_path[0] # preberem mnozilnik
-            del var_path[0] # pobrisem mnozilnik
-            xml_data_parcial = xml_data
-            for k in var_path:
-                if k in xml_data_parcial:
-                    xml_data_parcial = xml_data_parcial[k]
-            if xml_data_parcial is not None:
-                var_num =  float(multiplier) * float(xml_data_parcial)
-                mytmpdict[var_name] = str(round(var_num, 2))
-            debug = '  %s, %s' % (var_name,var_num)
-            Debug(debug)
+        xml_data = etree.fromstring(XMLGetValues(xml['url']))
+        for var in xml['vars']:
+            var_num = ''
+            try:
+                var_num =  float(var['multiplier']) * float(xml_data.xpath(var['path'])[0].text)
+                mytmpdict[var['name']] = str(round(var_num, 2))
+                debug = '  %s, %s' % (var['name'],var_num)
+                Debug(debug)
+            except:
+                debug = '  WARNING, no data for %s' % (var['name'])
+                Debug(debug)
     mydict[xml['dev']] = mytmpdict
     return mydict
 
+# ce ni novih podatkob ohranja staro vrednost!!!
 def DictUpdateFunction(Old,New):
     for dev in New.keys():
         if not dev in Old:
@@ -170,10 +170,18 @@ def DICT_MERGE():
     try:
         mydict = ReadDataFromRedis('poller-data')
     except:
-        mydict = ReadJSON(SCRIPT_DIR + '/' + 'poller.json')
+        try:
+            mydict = ReadJSON(SCRIPT_DIR + '/' + 'poller.json')
+        except:
+            debug = 'No such file or directory: poller.json!'
+            AddEntryToSyslog(debug)
+            Debug(debug)
+            mydict = {}
+            pass
         debug = 'Reading from redis failed, reading poller.json!'
         AddEntryToSyslog(debug)
         Debug(debug)
+    mydict = {} # povozim stare podatke in posiljam samo nove, ce to vrstico zakomentiram bo ohranjal tudi stare (vedno poslje last)
     mydict = DictUpdateFunction(mydict,JSONPoller())
     mydict = DictUpdateFunction(mydict,SNMPPoller())
     mydict = DictUpdateFunction(mydict,XMLPoller())
@@ -197,7 +205,7 @@ def send_metric(name, value, host, port):
                 AddEntryToSyslog(debug)
                 Debug(debug)
 
-def check_carbon_and_send_metrics(obj):
+def check_carbon_and_send_metrics(obj,dev2graphite):
     for graphite_host in poller_settings.GRAPHITE:
         s =  socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         result = s.connect_ex((graphite_host['host'],graphite_host['port']))
@@ -210,50 +218,42 @@ def check_carbon_and_send_metrics(obj):
             debug = 'Sending metrics to carbon at %s:%s!' % (graphite_host['host'], graphite_host['port'])
             Debug(debug)      
             for device in obj:
-                debug = ' Working on metrics for dev %s' % device
-                Debug(debug)
-                # ogrevanje !!! posebna obravnava zaradi PCF
-                if device == 'ogrevanje':
-                    obj.update(UpdateObjOgrevanjeSpecial(obj,device))
-                for var in obj[device]:
-                    try:
-                        send_metric(device + '.' + var,obj[device][var], graphite_host['host'], graphite_host['port'])
-                    except:
+                if dev2graphite[device]:
+                    debug = ' Working on metrics for dev %s' % device
+                    Debug(debug)
+                    for var in obj[device]:
                         try:
-                            send_metric(device + '.' + var,(obj[device][var]), graphite_host['host'], graphite_host['port'])
+                            send_metric(device + '.' + var,obj[device][var], graphite_host['host'], graphite_host['port'])
                         except:
-                            debug = ' Error send metric to %s:%s, %s' % (graphite_host['host'], graphite_host['port'], traceback.format_exc())
-                            AddEntryToSyslog(debug)
-                            Debug(debug)
+                            try:
+                                send_metric(device + '.' + var,(obj[device][var]), graphite_host['host'], graphite_host['port'])
+                            except:
+                                debug = ' Error send metric to %s:%s, %s' % (graphite_host['host'], graphite_host['port'], traceback.format_exc())
+                                AddEntryToSyslog(debug)
+                                Debug(debug)
 
-def DecToBit(decimal, bit):
-    if decimal>>bit & 1 == 0:
-        return 100
-    else:
-        return 0
 
-def UpdateObjOgrevanjeSpecial(obj,device):
-    mydict = {}
-    for var in obj[device]:
-        # ce se arduino restarta dobim cudne vrednosti... zato pocakam 2min, da se podatki stabilizirajo!
-        #if long(re.sub(r"\s+", "", obj[device]['Uptime'])) > 180: 
-        #send_metric(device + '.' + var,float(re.sub(r"\s+", "", obj[device][var])))
-        if var == 'PCF8574':
-            debug = ' Ogrevanje special PCF8574 int: %s' % obj[device][var]
+def check_influxdb_and_send_measurements(obj,dev2influx):
+    for influx_host in poller_settings.INFLUXDB:
+        s =  socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        result = s.connect_ex((influx_host['host'],influx_host['port']))
+        s.close()
+        if result:
+            debug = 'Influxdb at %s:%s is down, skipping!' % (influx_host['host'], influx_host['port'])
+            AddEntryToSyslog(debug)
             Debug(debug)
-            pcfnumber = int(re.sub(r"\s+", "", obj[device][var]))
-            mytmpdict = obj['ogrevanje'] # v tmp dict zapisem temparature, da potem dodam PCF data!
-            mytmpdict['PumpOgrevanje'] = DecToBit(pcfnumber,0)
-            mytmpdict['PumpBojler'] = DecToBit(pcfnumber,1)
-            mytmpdict['PumpSolar'] = DecToBit(pcfnumber,2)
-            mytmpdict['Emergency'] = DecToBit(pcfnumber,3)
-            mytmpdict['Vticnica'] = DecToBit(pcfnumber,4)
-            mytmpdict['Relay6'] = DecToBit(pcfnumber,5)
-            mytmpdict['Relay7'] = DecToBit(pcfnumber,6)
-            mytmpdict['Vrata'] = DecToBit(pcfnumber,7)
-            mydict[device] = mytmpdict
-            break
-    return mydict
+        else:
+            client = InfluxDBClient(influx_host['host'], influx_host['port'], influx_host['username'], influx_host['password'], influx_host['database'])
+            debug = 'Sending measurements to influxdb at %s:%s database:%s!' % (influx_host['host'], influx_host['port'], influx_host['database'])
+            Debug(debug)      
+            for device in obj:
+                if dev2influx[device]:
+                    debug = ' Working on measurements for dev %s' % device
+                    Debug(debug)
+                    measurement = {}
+                    measurement['fields'] = obj[device]
+                    measurement['measurement'] = device # nastavim ime meritve
+                    client.write_points([measurement])
 
 def PutToSleep():
     for sleep in poller_settings.GO_TO_SLEEP:
@@ -281,10 +281,35 @@ def Debug(debug):
     if FLAGS.log_file:
         AddEntryToLogFile(debug)
         
+def Dev2Influx():
+    # create lookup table for device to send to influx
+    dev2influx = {}
+    for line in poller_settings.JSON_POLLER:
+        dev2influx[line['name']] = line['send2influx']
+    for line in poller_settings.XML_POLLER:
+        dev2influx[line['dev']] = line['send2influx']
+    for line in poller_settings.SNMP_POLLER:
+        dev2influx[line['dev']] = line['send2influx']
+    return dev2influx  
+       
+def Dev2Graphite():
+    # create lookup table for device to send to carbon
+    dev2graphite = {}
+    for line in poller_settings.JSON_POLLER:
+        dev2graphite[line['name']] = line['send2graphite']
+    for line in poller_settings.XML_POLLER:
+        dev2graphite[line['dev']] = line['send2graphite']
+    for line in poller_settings.SNMP_POLLER:
+        dev2graphite[line['dev']] = line['send2graphite']
+    return dev2graphite  
+        
 def Main():
+    dev2influx = Dev2Influx()
+    dev2carbon = Dev2Graphite()
     obj = DICT_MERGE() 
-    if obj: 
-        check_carbon_and_send_metrics(obj)
+    if obj:
+        check_carbon_and_send_metrics(obj,dev2carbon)
+        check_influxdb_and_send_measurements(obj,dev2influx) 
     else:
         debug = ' Error no data from pollers'
         AddEntryToSyslog(debug)

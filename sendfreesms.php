@@ -108,13 +108,15 @@ function SendFreeSms($SmsProvider, $SmsUser, $SmsPwd, $SmsNum, $SmsMsg, $Send = 
 			if (curl_errno($ch) != 0) { throw new Exception(); }
 
 			preg_match("/<input value=\"([^\"]*?)\" name=\"t:formdata\"/", $response, $t_formdata);
-
-			curl_setopt($ch, CURLOPT_URL, "http://www.najdi.si/prijava.jsecloginform");
+                        //echo $response;
+			curl_setopt($ch, CURLOPT_URL, "https://www.najdi.si/prijava.jsecloginform");
 			curl_setopt($ch, CURLOPT_POST, true);
 			curl_setopt($ch, CURLOPT_HEADER, true);
 			$PostData = 't%3Aformdata=' . urlencode($t_formdata[1]) . "&jsecLogin=" . $SmsUser . "&jsecPassword=" . $SmsPwd;
 			curl_setopt($ch, CURLOPT_POSTFIELDS, $PostData);
 			$response = curl_exec($ch);
+			//echo $PostData;
+			//echo $response;
 			if (curl_errno($ch) != 0) { throw new Exception(); }
 
 			curl_setopt($ch, CURLOPT_URL, "http://www.najdi.si/najdi/sms");

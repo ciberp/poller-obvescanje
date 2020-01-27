@@ -11,6 +11,7 @@ import traceback
 import sys
 from subprocess import Popen, PIPE
 import redis
+import send_mail
 
 FailStates = 'StatesFail.json'
 OKStates = 'StatesOk.json'
@@ -147,7 +148,26 @@ def Main(*JSONMetricValue):
             Debug(debug)
     WriteSettingsJSONFormat(obvescanje_settings.OBVESCANJE)
     WOK(STATES_OK)
+    STATES_FAIL = CleanFailStates(STATES_FAIL)
     WFAIL(STATES_FAIL)
+    
+def CleanFailStates(data):
+    # ce metrica obstaja v nastavitvah, jo obdrzim, sicer jo pobrisem
+    metric_exists_in_settings = {}
+    for data_id in data:
+        metric_exists_in_settings[data_id] = False
+        for ln in obvescanje_settings.OBVESCANJE:
+            if data_id == ln['id']:
+                metric_exists_in_settings[data_id] = True
+                continue
+    #print metric_exists_in_settings
+    for metric in metric_exists_in_settings:
+        if not metric_exists_in_settings[metric]:
+            del data[metric]
+            debug = 'CLEANUP deleted non existant metric id=%s' % metric
+            AddEntryToSyslog(debug)
+            Debug(debug)
+    return data
   
 def PreveriRecovery(ln):
     global STATES_OK
@@ -230,7 +250,17 @@ def SendNow(obvestilo):
         AddEntryToSyslog(debug)
         Debug(debug)
         if not FLAGS.no_sms:
-            SendSMS([name],obvestilo['dev'] + ' ' + obvestilo['var'] + '(' + obvestilo['c'].strip() + ')' + ' ' + obvestilo['s'])
+            #SendSMS([name],obvestilo['dev'] + ' ' + obvestilo['var'] + '(' + obvestilo['c'].strip() + ')' + ' ' + obvestilo['s'])
+            SendMAIL(name,obvestilo['dev'] + ' ' + obvestilo['var'] + '(' + obvestilo['c'].strip() + ')' + ' ' + obvestilo['s'])
+
+
+def SendMAIL(name,msg):
+    send_mail.sendemail(from_addr    = obvescanje_settings.MAIL_SENDER['mail'], 
+         to_addr_list = [obvescanje_settings.MAIL_RECEIVERS[name]],
+         subject      = obvescanje_settings.MAIL_SENDER['subject'], 
+         message      = msg, 
+         login        = obvescanje_settings.MAIL_SENDER['username'], 
+         password     = obvescanje_settings.MAIL_SENDER['password'])
 
 def SendSMS(name,sms_str):
     if not FLAGS.no_sms:
@@ -312,7 +342,13 @@ if __name__ == '__main__':
             JSONMetricValue = ReadDataFromRedis('poller-data')
             Main(JSONMetricValue)
         except:
-            JSONMetricValue = ReadJSON(SCRIPT_DIR + '/' + 'poller.json')
+            try:
+                JSONMetricValue = ReadJSON(SCRIPT_DIR + '/' + 'poller.json')
+            except:
+                debug = 'No such file or directory: poller.json!'
+                AddEntryToSyslog(debug)
+                Debug(debug)
+                pass              
             Main(JSONMetricValue)
             debug = 'Reading from redis failed, reading poller.json!'
             AddEntryToSyslog(debug)
